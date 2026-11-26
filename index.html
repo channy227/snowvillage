@@ -64,8 +64,13 @@ body{
   left:max(16px,calc(env(safe-area-inset-left,0px) + 16px));top:calc(env(safe-area-inset-top,0px) + 84px);
   width:min(300px,calc(100% - 230px));
 }
-#chatLog div{background:rgba(10,17,34,.62);border:1px solid var(--line);border-radius:12px;padding:4px 10px;font-size:12.5px;line-height:1.45;color:var(--ink);overflow-wrap:anywhere;transition:opacity .8s}
-#chatLog div.sys{color:var(--muted);background:rgba(10,17,34,.45)}
+#logHist,#logSys{display:flex;flex-direction:column;gap:4px}
+#logHist div,#logSys div{background:rgba(10,17,34,.62);border:1px solid var(--line);border-radius:12px;padding:4px 10px;font-size:12.5px;line-height:1.45;color:var(--ink);overflow-wrap:anywhere;transition:opacity .8s}
+#logSys div{color:var(--muted);background:rgba(10,17,34,.45)}
+#chatLog i{font-style:normal;color:var(--muted);font-size:11px;margin-left:6px;white-space:nowrap}
+#chatLog.folded #logHist{display:none}
+#logToggle{pointer-events:auto;align-self:flex-start;font:inherit;font-size:11.5px;color:var(--muted);background:rgba(10,17,34,.55);border:1px solid var(--line);border-radius:999px;padding:3px 10px;cursor:pointer}
+#logToggle:focus-visible{outline:2px solid var(--ember);outline-offset:2px}
 #chatLog b{color:var(--ember);font-weight:400;margin-right:5px}
 #chatBar{
   position:fixed;z-index:8;left:50%;transform:translateX(-50%);bottom:calc(env(safe-area-inset-bottom,0px) + 96px);
@@ -80,7 +85,7 @@ body{
 #chatClose{flex:none;font:inherit;font-size:14px;color:var(--muted);background:transparent;border:0;padding:8px 6px;cursor:pointer}
 #chatBar button:focus-visible{outline:2px solid var(--ember);outline-offset:2px}
 .tag.peer{background:rgba(24,44,78,.72);border-color:rgba(160,200,255,.3)}
-@media (max-width:460px){#chatBar{bottom:calc(env(safe-area-inset-bottom,0px) + 222px)} #bName{max-width:76px}}
+@media (max-width:460px){#chatBar{bottom:calc(env(safe-area-inset-bottom,0px) + 222px)} #bName{max-width:76px} #chatLog{top:calc(env(safe-area-inset-top,0px) + 160px);width:calc(100% - 32px);max-width:420px;gap:3px} #logHist,#logSys{gap:3px} #logHist div,#logSys div{font-size:12px;line-height:1.35;padding:3px 8px;background:rgba(10,17,34,.5)}}
 .skybtn{pointer-events:auto;cursor:pointer;font:inherit;font-size:13px;color:var(--ink)}
 .skybtn[aria-pressed="true"]{border-color:rgba(255,183,94,.5);background:rgba(58,40,20,.8);color:#ffe2b8}
 .skybtn:focus-visible{outline:2px solid var(--ember);outline-offset:2px}
@@ -241,7 +246,7 @@ body{
     <button class="pill skybtn chatbtn" id="bChat" type="button" aria-pressed="false" title="Enter 키로도 열 수 있어요">채팅 · <span id="onlineN">1</span>명</button>
   </div>
 </header>
-<div id="chatLog" aria-live="polite"></div>
+<div id="chatLog"><button id="logToggle" type="button" aria-expanded="true" hidden>대화 접기</button><div id="logHist" aria-live="polite"></div><div id="logSys" aria-live="polite"></div></div>
 <form id="chatBar" hidden autocomplete="off">
   <button id="bName" type="button" title="이름 바꾸기"></button>
   <input id="chatInput" type="text" maxlength="80" placeholder="메시지를 입력하세요" enterkeyhint="send">
@@ -2030,6 +2035,7 @@ function releaseSnowball(k){
   k.inHand.visible=false;
   const start=k.hands[1].getWorldPosition(new V3());
   let end, dodge=false, tgt=k.tgt;
+  if(!tgt||(tgt!=='hero'&&!tgt.root)) return; // a very long frame can skip the aiming step
   if(tgt==='hero'){ end=new V3(hero.position.x,hero.position.y+1.0,hero.position.z); }
   else{
     end=new V3(tgt.root.position.x,.6,tgt.root.position.z);
@@ -3309,12 +3315,51 @@ const chatBar=$('#chatBar'), chatInput=$('#chatInput'), bName=$('#bName'), chatL
 const MP={room:null,ok:false,peers:new Map(),act:{},lastSend:0,lastState:'',lastChat:0,nameMode:false};
 const MP_ENABLED=typeof Trystero!=='undefined'&&!/claude|anthropic/i.test(location.hostname);
 const cleanText=(t,n)=>String(t||'').replace(/[\u0000-\u001f\u007f]/g,' ').replace(/\s+/g,' ').trim().slice(0,n);
-function logLine(name,text,sys){
-  const d=document.createElement('div'); if(sys) d.className='sys';
-  if(name){const b=document.createElement('b'); b.textContent=name; d.append(b);} d.append(document.createTextNode(text));
-  chatLogEl.append(d); while(chatLogEl.children.length>6) chatLogEl.firstChild.remove();
-  setTimeout(()=>{d.style.opacity='0'; setTimeout(()=>d.remove(),900);},25000);
+// Chat lines are kept: on screen (latest 10), in this browser (latest 200, survives a refresh),
+// and handed to visitors who join later, so the conversation carries on between visits.
+const LOG_SHOW=10, LOG_KEEP=200, logHist=$('#logHist'), logSys=$('#logSys'), logToggle=$('#logToggle');
+let chatHist=(()=>{const a=S.get('chat',[]); return Array.isArray(a)?a.filter(okEntry).slice(-LOG_KEEP):[];})();
+function okEntry(m){return m&&typeof m.i==='string'&&m.i.length<=24&&typeof m.t==='string'&&m.t&&typeof m.n==='string'&&Number.isFinite(m.ts);}
+const newId=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+function stamp(ts){
+  const d=new Date(ts), now=new Date(), p=v=>String(v).padStart(2,'0');
+  const hm=p(d.getHours())+':'+p(d.getMinutes());
+  return d.toDateString()===now.toDateString()?hm:(d.getMonth()+1)+'/'+d.getDate()+' '+hm;
 }
+function renderLog(){
+  logHist.textContent='';
+  for(const m of chatHist.slice(-LOG_SHOW)){
+    const d=document.createElement('div'), b=document.createElement('b'), i=document.createElement('i');
+    b.textContent=m.n; i.textContent=stamp(m.ts); d.append(b,document.createTextNode(m.t),i); logHist.append(d);
+  }
+  const folded=chatLogEl.classList.contains('folded');
+  logToggle.hidden=!chatHist.length;
+  logToggle.textContent=folded?'대화 펼치기 ('+Math.min(chatHist.length,LOG_SHOW)+')':'대화 접기';
+}
+function addChat(entries){ // merge, skip duplicates, keep time order
+  const seen=new Set(chatHist.map(m=>m.i)); let added=0;
+  for(const m of entries){ if(!okEntry(m)||seen.has(m.i)) continue; seen.add(m.i); chatHist.push(m); added++; }
+  if(!added) return;
+  chatHist.sort((a,b)=>a.ts-b.ts); if(chatHist.length>LOG_KEEP) chatHist=chatHist.slice(-LOG_KEEP);
+  S.set('chat',chatHist); renderLog();
+}
+function cleanEntry(m,name){
+  if(!m) return null;
+  const t=cleanText(m.t,80), n=cleanText(name!=null?name:m.n,10)||'방문자', ts=+m.ts, i=String(m.i||'').slice(0,24);
+  if(!t||!i||!Number.isFinite(ts)||ts>Date.now()+3e5||ts<Date.now()-90*864e5) return null; // ignore odd clocks and very old lines
+  return {i,n,t,ts};
+}
+function logLine(name,text,sys){ // short notices (joins, leaves, tips) fade away
+  const d=document.createElement('div');
+  if(name){const b=document.createElement('b'); b.textContent=name; d.append(b);} d.append(document.createTextNode(text));
+  logSys.append(d); while(logSys.children.length>3) logSys.firstChild.remove();
+  setTimeout(()=>{d.style.opacity='0'; setTimeout(()=>d.remove(),900);},9000);
+}
+logToggle.addEventListener('click',()=>{
+  const f=chatLogEl.classList.toggle('folded'); logToggle.setAttribute('aria-expanded',String(!f)); S.set('logFold',f); renderLog();
+});
+if(S.get('logFold',false)){chatLogEl.classList.add('folded'); logToggle.setAttribute('aria-expanded','false');}
+renderLog();
 function bubbleFor(holder,name,text){
   if(!holder.bub){holder.bub=document.createElement('div'); holder.bub.className='tag say'; labels.appendChild(holder.bub);}
   const b=document.createElement('b'); b.textContent=name; holder.bub.textContent=''; holder.bub.append(b,document.createTextNode(text));
@@ -3350,8 +3395,9 @@ function startMP(){
   try{
     const room=Trystero.joinRoom({appId:'snowplaza-chani-2026'},'plaza');
     MP.room=room; MP.ok=true;
-    MP.act.st=room.makeAction('st'); MP.act.ch=room.makeAction('ch'); MP.act.pf=room.makeAction('pf');
-    room.onPeerJoin=id=>{peerOf(id); MP.act.pf.send(profile(),{target:id}); MP.lastState='';};
+    MP.act.st=room.makeAction('st'); MP.act.ch=room.makeAction('ch'); MP.act.pf=room.makeAction('pf'); MP.act.hs=room.makeAction('hs');
+    room.onPeerJoin=id=>{peerOf(id); MP.act.pf.send(profile(),{target:id}); MP.lastState=''; if(chatHist.length) MP.act.hs.send(chatHist.slice(-50),{target:id});};
+    MP.act.hs.onMessage=d=>{ if(Array.isArray(d)) addChat(d.slice(-50).map(m=>cleanEntry(m)).filter(Boolean)); };
     room.onPeerLeave=id=>dropPeer(id);
     MP.act.pf.onMessage=(d,meta)=>{
       const p=peerOf(meta.peerId), n=cleanText(d&&d.n,10)||'방문자', l=(d&&LOOKS[d.l])?d.l:0;
@@ -3367,8 +3413,8 @@ function startMP(){
       p.seen=performance.now();
     };
     MP.act.ch.onMessage=(d,meta)=>{
-      const p=peerOf(meta.peerId), t=cleanText(d&&d.t,80); if(!t) return;
-      bubbleFor(p,p.name,t); logLine(p.name,t);
+      const p=peerOf(meta.peerId), m=cleanEntry({t:d&&d.t,i:d&&d.i,ts:d&&d.ts},p.name); if(!m) return;
+      bubbleFor(p,p.name,m.t); addChat([m]);
     };
   }catch(err){ MP.ok=false; }
 }
@@ -3376,8 +3422,9 @@ function sendChat(text){
   const t=cleanText(text,80); if(!t) return;
   const now=performance.now(); if(now-MP.lastChat<700){toast('조금 천천히 보내 주세요'); return;}
   MP.lastChat=now;
-  bubbleFor(meChat,myName,t); logLine(myName,t);
-  if(MP.ok) MP.act.ch.send({t});
+  const m={i:newId(),n:myName,t,ts:Date.now()};
+  bubbleFor(meChat,myName,t); addChat([m]);
+  if(MP.ok) MP.act.ch.send({t,i:m.i,ts:m.ts});
   else if(!MP_ENABLED) logLine('','다른 방문자와의 채팅은 외부 사이트(GitHub Pages 등)에서 열었을 때 연결돼요',true);
 }
 function openChat(){
